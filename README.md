@@ -4,12 +4,12 @@ A daily email that tells your household **when to run the washing machine, dishw
 
 Most Agile tools give you a chart or the single cheapest slot. This one does the thinking a sensible flatmate would:
 
-> **⚡ Tomorrow's electricity, Fri 27 Nov: washing after 21:00, nothing big 4–7pm**
+> **⚡ Electricity tonight & Fri 27 Nov: dishwasher on delay for 3am, washing after 21:00**
 >
 > Tomorrow is about 8% dearer than today. Prices stay above 50p all day and hit 72p around 16:30, then drop back to 31–35p after 9pm.
 >
-> - **Washing machine: 21:00–23:00**, ~33.5p/kWh. 3am is the absolute cheapest, but only 2p cheaper, so it isn't worth a midnight wash. Saves ~38p vs running it at 4pm.
-> - **Dishwasher: start at 20:30**, ~34.6p. Saves ~44p vs the peak.
+> - **Washing machine: Fri 21:00–23:00**, ~33.5p/kWh. 3am tonight is the absolute cheapest, but only 2p cheaper, and the clothes would sit wet all night. Saves ~38p vs running it at the 4pm peak.
+> - **Dishwasher: set the delay start for 03:00 tonight**, ~31p. You don't need to be awake for it.
 > - **Gaming PC:** after 9pm costs about half the peak rate. Saves ~40p over a 3-hour session.
 >
 > **Avoid:** 16:00–19:00 (avg 70p).
@@ -66,7 +66,10 @@ It shows you a preview of tomorrow's email before scheduling anything.
 ```bash
 python octopus-agile-advisor/scripts/agile.py region "EH9"
 python octopus-agile-advisor/scripts/agile.py analyse --config my-config.json
+python octopus-agile-advisor/scripts/agile.py history --region N --block-hours 6   # last 12 months, e.g. to compare with Octopus Go
 ```
+
+Not on Agile? The skill says so honestly instead of emailing you prices you don't pay. It can use `history` to give a rough comparison with your current tariff.
 
 See [`references/config.md`](octopus-agile-advisor/references/config.md) for the config format.
 

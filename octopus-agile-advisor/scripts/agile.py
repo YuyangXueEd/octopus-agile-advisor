@@ -111,8 +111,17 @@ def _iso(dt):
 # ------------------------------------------------------------------ Octopus
 
 def region_for_postcode(postcode):
-    res = _get(f"{API}/industry/grid-supply-points/", {"postcode": postcode.strip().upper()})["results"]
-    return res[0]["group_id"].lstrip("_") if res else None
+    pc = " ".join(postcode.strip().upper().split())
+    tries = [pc]
+    if " " in pc:
+        tries.append(pc.split(" ")[0])          # "EH8 9" or a mistyped inward code -> "EH8"
+    elif len(pc) >= 5:
+        tries.append(pc[:-3])                   # "EH93AB" -> "EH9"
+    for attempt in tries:
+        res = _get(f"{API}/industry/grid-supply-points/", {"postcode": attempt})["results"]
+        if res:
+            return res[0]["group_id"].lstrip("_"), attempt
+    return None, None
 
 
 def current_agile_product():
@@ -148,10 +157,27 @@ def _hhmm(utc_dt):
     return to_uk(utc_dt).strftime("%H:%M")
 
 
-def _label(utc_dt, today):
+def _label(utc_dt, today, awake_from=7 * 60):
+    """Human label as the household will read it on the evening of `today`.
+
+    02:00 on the next calendar date is "tonight" to anyone reading at 5pm, so
+    slots before tomorrow's wake-up time are labelled that way. Labelling them
+    "tomorrow 02:00" led test writers to tell people to charge a day late.
+    """
     local = to_uk(utc_dt)
-    day = {today: "today", today + timedelta(days=1): "tomorrow"}.get(local.date(), local.strftime("%a %d %b"))
-    return f"{day} {local.strftime('%H:%M')}"
+    return f"{_period(local, today, awake_from)} {local.strftime('%H:%M')}"
+
+
+def _period(local, today, awake_from=7 * 60):
+    d, mins, wd = local.date(), local.hour * 60 + local.minute, local.strftime("%a")
+    if d == today:
+        return "today" if local.hour < 17 else "tonight"
+    # "early hours" ends at wake-up, but never later than 07:00: 07:30 is morning
+    if d == today + timedelta(days=1) and mins < min(awake_from, 7 * 60):
+        return f"tonight (early hours of {wd})"
+    if d == today + timedelta(days=1):
+        return f"tomorrow ({wd})"
+    return local.strftime("%a %d %b")
 
 
 def _minutes(hhmm):
@@ -189,9 +215,9 @@ def _in_awake(run, awake_from, awake_to):
     return start_min >= awake_from and end_min <= awake_to
 
 
-def _describe(run, avg, kwh, today):
+def _describe(run, avg, kwh, today, awake_from):
     return {
-        "start": _label(run[0]["start"], today),
+        "start": _label(run[0]["start"], today, awake_from),
         "end": _hhmm(run[-1]["end"]),
         "avg_p": round(avg, 2),
         "cost_p": round(avg * kwh, 1),
@@ -200,41 +226,55 @@ def _describe(run, avg, kwh, today):
 
 def analyse_appliances(horizon, appliances, awake, today):
     awake_from, awake_to = _minutes(awake[0]), _minutes(awake[1])
+    typical = sum(s["p"] for s in horizon) / len(horizon) if horizon else 0
     out = []
     for a in appliances:
         hours = float(a["hours"])
         kwh = float(a["kwh"]) if a.get("kwh") is not None else float(a["kw"]) * hours
         n = max(1, math.ceil(hours * 2 - 1e-9))
         wins = list(_windows(horizon, n))
+        awake_wins = [w for w in wins if _in_awake(w[0], awake_from, awake_to)]
+        attended = bool(a.get("attended"))
+        if attended:
+            wins = awake_wins  # someone has to be there (gaming, ironing): never suggest 3am
         if not wins:
             out.append({"name": a["name"], "error": "not enough published slots for this run length"})
             continue
         best = min(wins, key=lambda w: w[1])
         worst = max(wins, key=lambda w: w[1])
-        awake_wins = [w for w in wins if _in_awake(w[0], awake_from, awake_to)]
         best_awake = min(awake_wins, key=lambda w: w[1]) if awake_wins else None
         entry = {
             "name": a["name"], "hours": hours, "kwh": round(kwh, 2),
+            "delay_start": a.get("delay_start"), "attended": attended,
             "note": a.get("note", ""),
-            "best_any_time": _describe(*best, kwh, today),
-            "best_awake": _describe(*best_awake, kwh, today) if best_awake else None,
-            "worst": _describe(*worst, kwh, today),
+            "best_any_time": _describe(*best, kwh, today, awake_from),
+            "best_awake": _describe(*best_awake, kwh, today, awake_from) if best_awake else None,
+            "worst": _describe(*worst, kwh, today, awake_from),
+            # vs the average price over the planning period: a fair "what you'd
+            # typically pay if you didn't think about it"; vs worst is the peak case
+            "saving_vs_typical_p": round((typical - best[1]) * kwh, 1),
             "saving_vs_worst_p": round((worst[1] - best[1]) * kwh, 1),
         }
         if best_awake:
             entry["awake_premium_p"] = round((best_awake[1] - best[1]) * kwh, 1)
+            entry["saving_awake_vs_typical_p"] = round((typical - best_awake[1]) * kwh, 1)
             entry["saving_awake_vs_worst_p"] = round((worst[1] - best_awake[1]) * kwh, 1)
         out.append(entry)
     return out
 
 
-def hourly_table(slots, today):
+def hourly_table(slots, today, awake_from):
+    """Hourly averages over the whole planning period (from now to the end of the
+    published data), labelled with the same periods as the appliance windows so
+    the table and the advice never disagree about which night is meant."""
     buckets = {}
     for s in slots:
         local = to_uk(s["start"])
         key = (local.date(), local.hour)
         buckets.setdefault(key, []).append(s["p"])
-    rows = [{"hour": f"{h:02d}:00", "day": "today" if d == today else "tomorrow", "avg_p": round(sum(v) / len(v), 2)}
+    rows = [{"hour": f"{h:02d}:00",
+             "period": _period(datetime(d.year, d.month, d.day, h), today, awake_from),
+             "avg_p": round(sum(v) / len(v), 2)}
             for (d, h), v in sorted(buckets.items())]
     ranked = sorted(rows, key=lambda r: r["avg_p"])
     k = max(1, len(rows) // 6)
@@ -283,8 +323,10 @@ def analyse(cfg, now_utc=None):
     tomorrow_slots = [s for s in slots if to_uk(s["start"]).date() == tomorrow]
     horizon = [s for s in slots if s["start"] >= now_utc]
 
+    awake_from = _minutes(cfg.get("awake_hours", ["07:00", "23:00"])[0])
     cheap_threshold = float(cfg.get("very_cheap_threshold_p", 15))
-    alerts = [{"at": _label(s["start"], today), "p": s["p"], "kind": "negative" if s["p"] <= 0 else "very_cheap"}
+    alerts = [{"at": _label(s["start"], today, awake_from), "p": s["p"],
+               "kind": "negative" if s["p"] <= 0 else "very_cheap"}
               for s in horizon if s["p"] < cheap_threshold]
 
     peak = None
@@ -304,16 +346,53 @@ def analyse(cfg, now_utc=None):
         "region": region, "region_name": REGION_NAMES.get(region, region), "agile_product": product,
         "tomorrow": tomorrow.isoformat(), "tomorrow_weekday": tomorrow.strftime("%A"),
         "tomorrow_published": len(tomorrow_slots) >= 40,
-        "published_until_uk": _label(last_end, today) if last_end else None,
+        "published_until_uk": _label(last_end, today, awake_from) if last_end else None,
         "stats": {"tomorrow": t_stats, "today": y_stats, "tomorrow_vs_today_pct": change},
         "peak_3h_tomorrow": peak,
         "alerts": alerts,
         "appliances": analyse_appliances(horizon, cfg.get("appliances", []),
                                          cfg.get("awake_hours", ["07:00", "23:00"]), today),
-        "hourly": hourly_table(tomorrow_slots, today),
+        "hourly": hourly_table(horizon, today, awake_from),
         "gas": gas_info(cfg, region, today),
         "language": cfg.get("language", "English"),
         "recipients": cfg.get("recipients", []),
+    }
+
+
+def history(region, days, product=None, now_utc=None, block_hours=4):
+    """Recent Agile averages, so someone can compare Agile with their current tariff."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    product = product or current_agile_product()
+    today = to_uk(now_utc).date()
+    first = today - timedelta(days=days)
+    slots = fetch_unit_rates("electricity", product, region.upper(), uk_midnight_as_utc(first),
+                             uk_midnight_as_utc(today))
+    if not slots:
+        raise RuntimeError(f"No historical prices for {product} region {region}.")
+    by_hour, by_day = {}, {}
+    for s in slots:
+        local = to_uk(s["start"])
+        by_hour.setdefault(local.hour, []).append(s["p"])
+        by_day.setdefault(local.date(), []).append(s)
+    n = max(1, int(round(block_hours * 2)))
+    best_block = [min(w[1] for w in _windows(v, n)) for v in by_day.values() if len(v) >= n]
+
+    def avg(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+
+    return {
+        "region": region.upper(), "agile_product": product, "days": len(by_day),
+        "from": first.isoformat(), "to": (today - timedelta(days=1)).isoformat(),
+        "avg_all_p": avg([s["p"] for s in slots]),
+        "avg_00_07_p": avg([p for h in range(0, 7) for p in by_hour.get(h, [])]),
+        "avg_07_16_p": avg([p for h in range(7, 16) for p in by_hour.get(h, [])]),
+        "avg_16_19_p": avg([p for h in range(16, 19) for p in by_hour.get(h, [])]),
+        "avg_19_24_p": avg([p for h in range(19, 24) for p in by_hour.get(h, [])]),
+        "block_hours": block_hours,
+        "avg_cheapest_block_per_day_p": avg(best_block),
+        "share_of_slots_below_15p": round(sum(s["p"] < 15 for s in slots) / len(slots), 3),
+        "negative_slots": sum(s["p"] <= 0 for s in slots),
+        "avg_by_hour_p": {f"{h:02d}:00": avg(v) for h, v in sorted(by_hour.items())},
     }
 
 
@@ -333,13 +412,26 @@ def main():
     a.add_argument("--wait-minutes", type=float, default=0,
                    help="if tomorrow's prices are not out yet, re-check every 3 minutes for up to this long")
     a.add_argument("--now", help="pretend it is this UTC time (ISO 8601), for testing")
+    h = sub.add_parser("history", help="recent Agile averages, to compare with another tariff")
+    h.add_argument("--region", required=True)
+    h.add_argument("--days", type=int, default=365,
+                   help="look-back period; keep a full year to avoid winter/summer bias (default 365)")
+    h.add_argument("--block-hours", type=float, default=4,
+                   help="length of the daily cheapest block to average, e.g. 6 to match an off-peak window")
     args = ap.parse_args()
 
     if args.cmd == "region":
-        letter = region_for_postcode(args.postcode)
-        print(json.dumps({"postcode": args.postcode, "region": letter,
-                          "region_name": REGION_NAMES.get(letter or "", None)}))
+        letter, matched = region_for_postcode(args.postcode)
+        result = {"postcode": args.postcode, "matched_postcode": matched, "region": letter,
+                  "region_name": REGION_NAMES.get(letter or "")}
+        if not letter:
+            result["hint"] = "Not recognised. Ask for the first half of the postcode (e.g. EH9, SW11)."
+        print(json.dumps(result))
         return 0 if letter else 1
+
+    if args.cmd == "history":
+        print(json.dumps(history(args.region, args.days, block_hours=args.block_hours), indent=1))
+        return 0
 
     with open(args.config, encoding="utf-8") as fh:
         cfg = json.load(fh)
